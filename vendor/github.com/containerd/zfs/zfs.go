@@ -94,7 +94,7 @@ var (
 func defaultNewProps(kind snapshots.Kind) (map[string]string, error) {
 	props := zfsCreateProperties
 	props[propKind] = fmt.Sprintf("%d", kind)
-	props[propParentName] = ""
+	props[propParentName] = "-"
 	ts, err := time.Now().MarshalText()
 	if err != nil {
 		return props, err
@@ -114,8 +114,11 @@ func createFilesystem(datasetName string, kind snapshots.Kind) (*zfs.Dataset, er
 }
 
 // cloneFilesystem clones but not mount.
-func cloneFilesystem(datasetName string, snapshot *zfs.Dataset) (*zfs.Dataset, error) {
-	props := make(map[string]string)
+func cloneFilesystem(datasetName string, kind snapshots.Kind, snapshot *zfs.Dataset) (*zfs.Dataset, error) {
+	props, err := defaultNewProps(kind)
+	if err != nil {
+		return nil, err
+	}
 	props[propParentName] = filepath.Base(snapshot.Name)
 	return snapshot.Clone(datasetName, props)
 }
@@ -180,16 +183,13 @@ func (z *snapshotter) usage(ctx context.Context, key string) (snapshots.Usage, e
 // Walk the committed snapshots.
 func (z *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters ...string) error {
 	// Granted this is gonna be slooow.. Still a test implementation, this, though
-	
-	//type WalkFunc func(context.Context, Info) error
-	all, err := z.getPropsForMultipleDatasets("")
-	if err != nil {
-		return err
-	}
 
-	var info snapshots.Info
+	//type WalkFunc func(context.Context, Info) error
+	//all, err := z.getPropsForMultipleDatasets("")
+	all := propCache
+
 	for name, v := range all {
-		info, err = z.infoFromProps(filepath.Base(name), v)
+		info, err := z.infoFromProps(filepath.Base(name), v)
 		if err != nil {
 			return err
 		}
@@ -226,6 +226,8 @@ func (z *snapshotter) getDatasetName_(key string) string {
 
 func (z *snapshotter) infoFromProps(name string, props map[string]string) (snapshots.Info, error) {
 	var labels = make(map[string]string)
+	fmt.Printf("infoFromProps: props: %v, kind: %d\n", props, props[propKind])
+
 	kind, perr := strconv.ParseInt(props[propKind], 10, 0)
 	if perr != nil {
 		return snapshots.Info{}, perr
@@ -252,13 +254,19 @@ func (z *snapshotter) infoFromProps(name string, props map[string]string) (snaps
 	}, nil
 }
 
+var propCache = make(map[string]map[string]string)
+
 func (z *snapshotter) getProps(key string) (map[string]string, error) {
 	dummy := make(map[string]string)
+	if propCache[key] != nil {
+		return propCache[key], nil
+	}
 	res, err := z.getPropsForMultipleDatasets(key)
 	if err != nil {
 		return dummy, err
 	}
 	for _, v := range res {
+		propCache[key] = v
 		return v, nil
 	}
 	
@@ -273,23 +281,37 @@ func (z *snapshotter) getPropsForMultipleDatasets(key string) (map[string]map[st
 	propNames := []string{propKind, propParentName, propCreated, propUpdated}
 	propNamesStr := strings.Join(propNames, ",")
 
-	var zfsPath, optionalRecursiveness string
+	var zfsPath string
+	recursive := false
 	if key != "" {
 		zfsPath = z.getDatasetName_(key)
 	} else {
-		optionalRecursiveness = "-r"
+		recursive = true
 		zfsPath = z.dataset.Name
 	}
 
-	args := []string{
-		"get",
-		"-o", "name,property,value",
-		"-H",
-		"-s", "local",
-		optionalRecursiveness,
-		propNamesStr,
-		zfsPath,
+	var args []string
+	if recursive {
+		args = []string{
+			"get",
+			"-o", "name,property,value",
+			"-H",
+			"-s", "local",
+			"-r",
+			propNamesStr,
+			zfsPath,
+		}
+	} else {
+		args = []string{
+			"get",
+			"-o", "name,property,value",
+			"-H",
+			"-s", "local",
+			propNamesStr,
+			zfsPath,
+		}
 	}
+
 	cmd := exec.Command("zfs", args...)
 
 	var stdout bytes.Buffer
@@ -319,7 +341,7 @@ func (z *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	var parentSnapshotID string
 	var parentDataset *zfs.Dataset
 	var perr error
-	if parent != "" {
+	if parent != "" || parent == "-" {
 		parentSnapshotID = getSnapshotID(parent)
 		parentDatasetName := z.getDatasetName(parentSnapshotID)
 		parentDataset, perr = zfs.GetDataset(parentDatasetName)
@@ -343,7 +365,7 @@ func (z *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		if err != nil {
 			return nil, err
 		}
-		target, err = cloneFilesystem(targetName, parent0)
+		target, err = cloneFilesystem(targetName, kind, parent0)
 		if err != nil {
 			return nil, err
 		}
@@ -370,25 +392,43 @@ func (z *snapshotter) mounts(dataset *zfs.Dataset, readonly bool) ([]mount.Mount
 func (z *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) (err error) {
 	
 	activeName := z.getDatasetName_(key)
-	active, err := zfs.GetDataset(activeName)
-	if err != nil {
-		return err
-	}
-	var props map[string]string
-	props, err = z.getProps(activeName)
+
+	before := time.Now()
+
+	_, err = zfs.GetDataset(activeName)
 	if err != nil {
 		return err
 	}
 
-	_, err = cloneFilesystem_(z.getDatasetName(name), active, props)
+	normalizedName := z.getDatasetName_(name)
+
+	args := []string{
+		"rename",
+		activeName,
+		normalizedName,
+	}
+
+	cmd := exec.Command("zfs", args...)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err = cmd.Run()
 	if err != nil {
 		return err
 	}
 
-	_, err = active.Snapshot(snapshotSuffix, false)
-	if err != nil {
-		return err
+	renamed, rnerr := zfs.GetDataset(normalizedName)
+	if rnerr != nil {
+		return rnerr
 	}
+
+	_, serr := renamed.Snapshot(snapshotSuffix, false)
+	if serr != nil {
+		return serr
+	}
+	after := time.Now()
+	fmt.Println("snapshotDataset: ", after.Sub(before))
 
 	return nil
 }
