@@ -80,6 +80,8 @@ func (u *unpacker) unpack(
 	config ocispec.Descriptor,
 	layers []ocispec.Descriptor,
 ) error {
+	before := time.Now()
+
 	p, err := content.ReadBlob(ctx, u.c.ContentStore(), config)
 	if err != nil {
 		return err
@@ -239,6 +241,8 @@ EachLayer:
 			return err
 		}
 
+		after := time.Now()
+		fmt.Println("unpack: ", after.Sub(before))
 	}
 
 	chainID := identity.ChainID(chain).String()

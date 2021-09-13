@@ -32,6 +32,7 @@ import (
 	"time"
 	"strconv"
 	"regexp"
+	"encoding/json"
 
 	// "github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
@@ -54,6 +55,7 @@ const (
 	propParentName = "containerd:parent"
 	propCreated = "containerd:created"
 	propUpdated = "containerd:updated"
+	propLabels = "containerd:labels"
 )
 
 var zfsPropRegex = regexp.MustCompile("([^\\s]+)\\s+([^\\s]+)\\s+(.+)")
@@ -225,7 +227,7 @@ func (z *snapshotter) getDatasetName_(key string) string {
 }
 
 func (z *snapshotter) infoFromProps(name string, props map[string]string) (snapshots.Info, error) {
-	var labels = make(map[string]string)
+	var labels map[string]string
 	fmt.Printf("infoFromProps: props: %v, kind: %d\n", props, props[propKind])
 
 	kind, perr := strconv.ParseInt(props[propKind], 10, 0)
@@ -242,6 +244,11 @@ func (z *snapshotter) infoFromProps(name string, props map[string]string) (snaps
 	uerr := updated.UnmarshalText([]byte(props[propUpdated]))
 	if uerr != nil {
 		return snapshots.Info{}, uerr
+	}
+
+	jerr := json.Unmarshal([]byte(props[propLabels]), &labels)
+	if jerr != nil {
+		labels = make(map[string]string)
 	}
 
 	return snapshots.Info{
@@ -278,7 +285,7 @@ func (z *snapshotter) getPropsForMultipleDatasets(key string) (map[string]map[st
 
 	var props = make(map[string]map[string]string)
 
-	propNames := []string{propKind, propParentName, propCreated, propUpdated}
+	propNames := []string{propKind, propParentName, propCreated, propUpdated, propLabels}
 	propNamesStr := strings.Join(propNames, ",")
 
 	var zfsPath string
@@ -395,35 +402,24 @@ func (z *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 
 	before := time.Now()
 
-	_, err = zfs.GetDataset(activeName)
+	active, err := zfs.GetDataset(activeName)
 	if err != nil {
 		return err
 	}
 
 	normalizedName := z.getDatasetName_(name)
 
-	args := []string{
-		"rename",
-		activeName,
-		normalizedName,
+	activeSnap, pserr := active.Snapshot(snapshotSuffix, false)
+	if pserr != nil {
+		return pserr
 	}
 
-	cmd := exec.Command("zfs", args...)
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	err = cmd.Run()
-	if err != nil {
-		return err
+	cloned, cerr := cloneFilesystem(normalizedName, snapshots.KindCommitted, activeSnap)
+	if cerr != nil {
+		return cerr
 	}
 
-	renamed, rnerr := zfs.GetDataset(normalizedName)
-	if rnerr != nil {
-		return rnerr
-	}
-
-	_, serr := renamed.Snapshot(snapshotSuffix, false)
+	_, serr := cloned.Snapshot(snapshotSuffix, false)
 	if serr != nil {
 		return serr
 	}
@@ -475,8 +471,42 @@ func (z *snapshotter) Remove(ctx context.Context, key string) (err error) {
 }
 
 func (o *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (snapshots.Info, error) {
-	//TODO: noop until we support labeling
-	return info, nil
+	updated := snapshots.Info{
+		Name: info.Name,
+	}
+	datasetName := o.getDatasetName(info.Name)
+	dataset, err := zfs.GetDataset(datasetName)
+	if err != nil {
+		return updated, err
+	}
+	if len(fieldpaths) > 0 {
+		for _, path := range fieldpaths {
+			if strings.HasPrefix(path, "labels.") {
+				if updated.Labels == nil {
+					updated.Labels = map[string]string{}
+				}
+
+				key := strings.TrimPrefix(path, "labels.")
+				updated.Labels[key] = info.Labels[key]
+				continue
+			}
+
+			switch path {
+			case "labels":
+				updated.Labels = info.Labels
+			default:
+				return updated, errors.New("Cannot update fields on snapshot")
+			}
+		}
+
+		labels, jerr := json.Marshal(updated.Labels)
+		if jerr != nil {
+			return info, nil
+		}
+		dataset.SetProperty(propLabels, string(labels))
+	}
+
+	return updated, nil
 }
 
 func (o *snapshotter) Close() error {
